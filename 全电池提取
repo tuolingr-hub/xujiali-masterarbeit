@@ -1,8 +1,7 @@
 """
-全电池峰锚定特征提取 —— 四模块
-读 usable_batteries.csv,挨个用峰锚定管线提取,各存 peak_features/{bid}_peak_features.csv
-模块1动态3C剥离 + 模块2峰锚定 + 模块3 16×3+2重构 + 模块4 PCHIP标签
-容错+断点续跑
+全电池峰锚定特征提取 —— 无SOC/DOD版(利于LFP→NCA迁移)
+输入设计: 16×3曲线(Q/dQ/IC) + 2标量(Vpeak0,dVpeak) + Temp + SOH标签
+不含SOC/DOD(测试协议变量,迁移时会变,靠曲线+Vpeak0隐含表达)
 """
 import s3fs, re, numpy as np, pandas as pd, os, time
 import pyarrow.parquet as pq
@@ -20,27 +19,25 @@ CAP="projects/j8005-metabatt/Metabatt/A123/40_capacity_monitore"
 fs=s3fs.S3FileSystem(**OPTS)
 os.makedirs("peak_features",exist_ok=True)
 
-# ===== 参数 =====
 N_PTS=16; HALF_WIN=0.06; DV=0.005; SIGMA=2; TOL=0.25; PROM=0.15
 
-def parse_cond(af):
+def parse_temp_crate(af):
+    """只解析温度和C_Rate(确认3C用),不要SOC/DOD"""
     for f in af:
         m=re.search(r'(\d+)grad_(\d+)SOC_(\d+)DOD_(\d+)C',f.split('/')[-1])
-        if m: return {'Temp':int(m.group(1)),'SOC':int(m.group(2)),'DOD':int(m.group(3)),'C_Rate':int(m.group(4))}
+        if m: return {'Temp':int(m.group(1)),'C_Rate':int(m.group(4))}
     return None
 
 def build_pchip_soh(bid):
-    """模块4:PCHIP保形单调SOH"""
     c=pd.read_csv(f"s3://{CAP}/METABatt_A123_APR18650M1B_{bid}_capacity.csv",
                   storage_options=OPTS).dropna(subset=['SOH'])
     c['t']=pd.to_datetime(c['CAP_start_time']); c=c.sort_values('t').reset_index(drop=True)
     t_ns=c['t'].astype('int64').values.astype(float); soh=c['SOH'].values.copy()
     for i in range(1,len(soh)):
-        if soh[i]>soh[i-1]: soh[i]=soh[i-1]   # 强制单调递减
+        if soh[i]>soh[i-1]: soh[i]=soh[i-1]   # 单调递减
     return PchipInterpolator(t_ns,soh,extrapolate=True), c['Capacity_py'].iloc[0]
 
 def build_cap_interp(bid):
-    """模块1:C_now插值"""
     c=pd.read_csv(f"s3://{CAP}/METABatt_A123_APR18650M1B_{bid}_capacity.csv",
                   storage_options=OPTS).dropna(subset=['Capacity_py'])
     c['t']=pd.to_datetime(c['CAP_start_time']); c=c.sort_values('t')
@@ -54,7 +51,6 @@ def get_raw(df,state,sign):
     return [df.iloc[s:e] for s,e in zip(st,en) if e-s>=30]
 
 def is_3c_dynamic(seg,cap_t,cap_v):
-    """模块1:动态3C ±25%"""
     t=pd.to_datetime(seg['Zeit'].iloc[0]).value
     C_now=np.interp(t,cap_t,cap_v); It=3*C_now
     I=abs(seg['Strom'].mean())
@@ -62,7 +58,6 @@ def is_3c_dynamic(seg,cap_t,cap_v):
     return (It*(1-TOL)<I<It*(1+TOL)) and tt[-1]>=60
 
 def get_ic_peak(seg):
-    """模块2:绝对电压网格→高斯→IC→找峰"""
     V=seg['Spannung'].values; I=seg['Strom'].values
     tt=(pd.to_datetime(seg['Zeit'])-pd.to_datetime(seg['Zeit']).iloc[0]).dt.total_seconds().values
     Q=np.cumsum(np.abs(I)*np.diff(tt,prepend=tt[0])/3600.0)
@@ -80,7 +75,6 @@ def get_ic_peak(seg):
     return vgrid,Qsm,IC,Vpeak
 
 def reconstruct(seg,ref_refQ,ref_dvaxis,Vpeak0):
-    """模块3:16×3+2"""
     r=get_ic_peak(seg)
     if r is None: return None
     vgrid,Qsm,IC,Vpeak=r
@@ -94,9 +88,10 @@ def reconstruct(seg,ref_refQ,ref_dvaxis,Vpeak0):
 def process(bid):
     BASE=f"{RAWBASE}/METABatt_A123_APR18650M1B_{bid}"
     aging=sorted([f for f in fs.ls(BASE) if 'Aging' in f and 'Cyc' in f])
-    cond=parse_cond(aging)
+    tc=parse_temp_crate(aging)
+    if tc is None or tc['C_Rate']!=3: return None,"非3C或解析失败"
     pchip,C0=build_pchip_soh(bid); cap_t,cap_v=build_cap_interp(bid)
-    # 第一遍:从最早文件找Vpeak0和参考Q
+    # 第一遍:Vpeak0 + 参考Q
     Vpeak0=None; ref_refQ=None; ref_dvaxis=np.linspace(-HALF_WIN,HALF_WIN,N_PTS)
     with fs.open(aging[0]) as fh:
         df0=next(pq.ParquetFile(fh).iter_batches(batch_size=500000,
@@ -124,17 +119,18 @@ def process(bid):
             if feat is None: continue
             t=pd.to_datetime(seg['Zeit'].iloc[0])
             soh=float(pchip(t.value))
-            row={'bid':bid,'SOC':cond['SOC'],'DOD':cond['DOD'],'Temp':cond['Temp'],
-                 'SOH':soh,'time':t,'Vpeak':feat['Vpeak'],'Vpeak0':Vpeak0,'dVpeak':feat['dVpeak']}
+            # 注意:row里没有SOC/DOD,只有Temp
+            row={'bid':bid,'Temp':tc['Temp'],'SOH':soh,'time':t,
+                 'Vpeak':feat['Vpeak'],'Vpeak0':Vpeak0,'dVpeak':feat['dVpeak']}
             for k in range(N_PTS): row[f'Q_{k}']=feat['Q'][k]
             for k in range(N_PTS): row[f'dQ_{k}']=feat['dQ'][k]
             for k in range(N_PTS): row[f'IC_{k}']=feat['IC'][k]
             rows.append(row)
-    return (pd.DataFrame(rows),f"{len(rows)}样本,Vpeak0={Vpeak0:.3f}") if rows else (None,"无有效样本")
+    return (pd.DataFrame(rows),f"{len(rows)}样本,Vpeak0={Vpeak0:.3f},Temp={tc['Temp']}") if rows else (None,"无有效样本")
 
 # ===== 主循环 =====
 ub=pd.read_csv("usable_batteries.csv",dtype={'bid':str})
-print(f"待提取{len(ub)}块\n")
+print(f"待提取{len(ub)}块 (无SOC/DOD,只存Temp)\n")
 log=[]; t0=time.time()
 for idx,bid in enumerate(ub['bid']):
     out=f"peak_features/{bid}_peak_features.csv"
@@ -149,5 +145,6 @@ for idx,bid in enumerate(ub['bid']):
 
 logdf=pd.DataFrame(log,columns=['bid','status','n']); logdf.to_csv("peak_extract_log.csv",index=False)
 ok=logdf[logdf['status']=='OK']
-print(f"\n成功{len(ok)}块, 总样本{ok['n'].sum()}, 用时{(time.time()-t0)/60:.1f}分")
-print(f"失败:{len(logdf)-len(ok)}块 →", dict(logdf[logdf['status']!='OK']['status'].value_counts()))
+print(f"\n成功{len(ok)}块,总样本{ok['n'].sum()},用时{(time.time()-t0)/60:.1f}分")
+if len(logdf)-len(ok)>0:
+    print("失败原因:", dict(logdf[logdf['status']!='OK']['status'].value_counts()))
