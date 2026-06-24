@@ -1,0 +1,180 @@
+峰附近Q ΔQ dQ Vpeak0 ΔVpeak峰的移动
+  第一遍(算一次):
+  最早健康循环 → 找峰 → Vpeak0(基准,固定)
+
+第二遍(每个循环):
+  这个循环 → 找它自己的峰 Vpeak(i)
+            → ΔVpeak(i) = Vpeak0 - Vpeak(i)   ← 动态横移
+            → 以 Vpeak(i) 为零点取16点曲线      ← 每个循环各自对齐到自己的峰
+    """
+单电池 峰锚定特征提取 —— 四模块完整版
+模块1:动态3C剥离  模块2:峰锚定(ΔV坐标)  模块3:16×3+2重构  模块4:PCHIP标签
+输出: 每个3C循环 → [16×3曲线 + 2标量 + 工况 + SOH]
+"""
+import s3fs, re, numpy as np, pandas as pd
+import pyarrow.parquet as pq
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
+from scipy.interpolate import PchipInterpolator
+import warnings; warnings.filterwarnings('ignore')
+from s3_credentials import S3_ACCESS_KEY, S3_SECRET_KEY
+
+OPTS={"key":S3_ACCESS_KEY,"secret":S3_SECRET_KEY,
+      "client_kwargs":{"endpoint_url":"https://iseadocker.isea.rwth-aachen.de:9000","region_name":"us-east-1"},
+      "config_kwargs":{"s3":{"addressing_style":"path"},"signature_version":"s3v4"}}
+RAWBASE="projects/j8005-metabatt/Metabatt/A123"
+CAP="projects/j8005-metabatt/Metabatt/A123/40_capacity_monitore"
+fs=s3fs.S3FileSystem(**OPTS)
+
+# ===== 参数 =====
+BID="008"
+N_PTS=16            # 峰附近取点数
+HALF_WIN=0.06       # 峰中心±窗口(V),LFP用窄窗
+DV=0.005            # 电压网格分辨率
+SIGMA=2             # 高斯平滑
+TOL=0.25            # 3C容差±25%
+
+def parse_cond(af):
+    for f in af:
+        m=re.search(r'(\d+)grad_(\d+)SOC_(\d+)DOD_(\d+)C',f.split('/')[-1])
+        if m: return {'Temp':int(m.group(1)),'SOC':int(m.group(2)),'DOD':int(m.group(3)),'C_Rate':int(m.group(4))}
+    return None
+
+# ===== 模块4准备:PCHIP的SOH标签函数 =====
+def build_pchip_soh(bid):
+    f=f"{CAP}/METABatt_A123_APR18650M1B_{bid}_capacity.csv"
+    c=pd.read_csv(f"s3://{f}",storage_options=OPTS).dropna(subset=['SOH'])
+    c['t']=pd.to_datetime(c['CAP_start_time']); c=c.sort_values('t').reset_index(drop=True)
+    t_ns=c['t'].astype('int64').values.astype(float)
+    soh=c['SOH'].values.copy()
+    # 强制单调递减(消除测量反弹),PCHIP保形
+    for i in range(1,len(soh)):
+        if soh[i]>soh[i-1]: soh[i]=soh[i-1]   # 不允许回升
+    pchip=PchipInterpolator(t_ns,soh,extrapolate=True)
+    C0=c['Capacity_py'].iloc[0]
+    return pchip, t_ns, C0
+
+# ===== 模块1:动态3C剥离 =====
+def build_capacity_interp(bid):
+    """用capacity.csv插值出任意时刻的C_now"""
+    f=f"{CAP}/METABatt_A123_APR18650M1B_{bid}_capacity.csv"
+    c=pd.read_csv(f"s3://{f}",storage_options=OPTS).dropna(subset=['Capacity_py'])
+    c['t']=pd.to_datetime(c['CAP_start_time']); c=c.sort_values('t')
+    return c['t'].astype('int64').values.astype(float), c['Capacity_py'].values
+
+def get_raw(df,state,sign):
+    m=((df['Zustand']==state)&(np.sign(df['Strom'])==sign)).values
+    ch=np.diff(m.astype(int));st=np.where(ch==1)[0]+1;en=np.where(ch==-1)[0]+1
+    if len(m)>0 and m[0]:st=np.r_[0,st]
+    if len(en)<len(st):en=np.r_[en,len(df)]
+    return [df.iloc[s:e] for s,e in zip(st,en) if e-s>=30]
+
+def is_3c_dynamic(seg, cap_t, cap_v):
+    """动态3C:用该段时刻的C_now,±25%容差"""
+    t=pd.to_datetime(seg['Zeit'].iloc[0]).value
+    C_now=np.interp(t, cap_t, cap_v)
+    I_target=3*C_now
+    I=abs(seg['Strom'].mean())
+    tt=(pd.to_datetime(seg['Zeit'])-pd.to_datetime(seg['Zeit']).iloc[0]).dt.total_seconds().values
+    return (I_target*(1-TOL) < I < I_target*(1+TOL)) and tt[-1]>=60
+
+# ===== 模块2:峰锚定 =====
+def get_ic_and_peak(seg):
+    """放电段→绝对电压网格→高斯→IC→找峰。返回(vgrid,Qgrid,IC,Vpeak)"""
+    V=seg['Spannung'].values; I=seg['Strom'].values
+    tt=(pd.to_datetime(seg['Zeit'])-pd.to_datetime(seg['Zeit']).iloc[0]).dt.total_seconds().values
+    Q=np.cumsum(np.abs(I)*np.diff(tt,prepend=tt[0])/3600.0)
+    if Q[-1]<=0: return None
+    o=np.argsort(V); Vu,idx=np.unique(V[o],return_index=True); Qu=Q[o][idx]
+    if len(Vu)<10: return None
+    vgrid=np.arange(Vu.min(),Vu.max(),DV)
+    if len(vgrid)<2*N_PTS: return None
+    Qg=np.interp(vgrid,Vu,Qu)
+    Qsm=gaussian_filter1d(Qg,sigma=SIGMA)
+    IC=np.abs(np.gradient(Qsm,vgrid))
+    if IC.max()<=0: return None
+    peaks,_=find_peaks(IC,prominence=IC.max()*0.15)
+    if len(peaks)==0: return None
+    Vpeak=vgrid[peaks[np.argmax(IC[peaks])]]   # 最高峰
+    return vgrid, Qsm, IC, Vpeak
+
+# ===== 模块3:16×3+2重构 =====
+def reconstruct_features(seg, ref_Qfunc, Vpeak0):
+    """以峰为中心取16点的Q/ΔQ/IC + 2标量"""
+    r=get_ic_and_peak(seg)
+    if r is None: return None
+    vgrid,Qsm,IC,Vpeak=r
+    # ΔV坐标:以本循环峰为零点,取±HALF_WIN
+    dv_axis=np.linspace(-HALF_WIN,HALF_WIN,N_PTS)
+    abs_v=Vpeak+dv_axis                       # 对应的绝对电压
+    # 在本循环曲线上插值出这16点的Q和IC
+    Q16=np.interp(abs_v,vgrid,Qsm,left=np.nan,right=np.nan)
+    IC16=np.interp(abs_v,vgrid,IC,left=np.nan,right=np.nan)
+    if np.isnan(Q16).any(): return None       # 窗口超出该循环电压范围→丢弃
+    # ΔQ:相对参考(初始)循环在相同ΔV位置的Q
+    dQ16 = Q16 - ref_Qfunc(dv_axis) if ref_Qfunc is not None else np.zeros(N_PTS)
+    # 2标量
+    dVpeak = Vpeak0 - Vpeak                    # 峰横移(LLI/内阻)
+    return {'Q':Q16,'dQ':dQ16,'IC':IC16,'Vpeak':Vpeak,'dVpeak':dVpeak}
+
+# ================= 主流程 =================
+BASE=f"{RAWBASE}/METABatt_A123_APR18650M1B_{BID}"
+aging=sorted([f for f in fs.ls(BASE) if 'Aging' in f and 'Cyc' in f])
+cond=parse_cond(aging)
+pchip_soh,_,C0=build_pchip_soh(BID)
+cap_t,cap_v=build_capacity_interp(BID)
+print(f"电池{BID}: {cond['Temp']}℃/{cond['SOC']}SOC/{cond['DOD']}DOD, C0={C0:.3f}")
+
+# 第一遍:找参考循环(最早的健康循环),建立 ΔV→Q 的参考函数 和 Vpeak0
+ref_Qfunc=None; Vpeak0=None
+with fs.open(aging[0]) as fh:
+    df0=next(pq.ParquetFile(fh).iter_batches(batch_size=500000,
+            columns=['Zeit','Spannung','Strom','Zustand']).__iter__()).to_pandas()
+df0['Zeit']=pd.to_datetime(df0['Zeit'])
+for seg in get_raw(df0,'DCH',-1):
+    if not is_3c_dynamic(seg,cap_t,cap_v): continue
+    r=get_ic_and_peak(seg)
+    if r is None: continue
+    vgrid,Qsm,IC,Vpeak=r
+    Vpeak0=Vpeak
+    # 参考Q作为ΔV的函数(以峰为中心)
+    dv_axis=np.linspace(-HALF_WIN,HALF_WIN,N_PTS)
+    refQ=np.interp(Vpeak+dv_axis,vgrid,Qsm,left=np.nan,right=np.nan)
+    if not np.isnan(refQ).any():
+        ref_Qfunc=lambda dv,_r=refQ,_d=dv_axis: np.interp(dv,_d,_r)
+        break
+print(f"参考峰位 Vpeak0={Vpeak0:.4f}V")
+
+# 第二遍:全部循环提取
+rows=[]
+for fi,f in enumerate(aging):
+    with fs.open(f) as fh:
+        df=next(pq.ParquetFile(fh).iter_batches(batch_size=500000,
+                columns=['Zeit','Spannung','Strom','Zustand']).__iter__()).to_pandas()
+    df['Zeit']=pd.to_datetime(df['Zeit'])
+    dch=[s for s in get_raw(df,'DCH',-1) if is_3c_dynamic(s,cap_t,cap_v)]
+    n_ok=0
+    for seg in dch:
+        feat=reconstruct_features(seg, ref_Qfunc, Vpeak0)
+        if feat is None: continue              # 没找到峰/窗口超界→丢
+        t=pd.to_datetime(seg['Zeit'].iloc[0])
+        soh=float(pchip_soh(t.value))          # 模块4:PCHIP标签
+        row={'bid':BID,'SOC':cond['SOC'],'DOD':cond['DOD'],'Temp':cond['Temp'],
+             'SOH':soh,'time':t,'Vpeak':feat['Vpeak'],'dVpeak':feat['dVpeak']}
+        for k in range(N_PTS): row[f'Q_{k}']=feat['Q'][k]
+        for k in range(N_PTS): row[f'dQ_{k}']=feat['dQ'][k]
+        for k in range(N_PTS): row[f'IC_{k}']=feat['IC'][k]
+        rows.append(row); n_ok+=1
+    print(f"  [{fi+1}/{len(aging)}] 3C{len(dch)} 成功锚定{n_ok} 累计{len(rows)}")
+
+data=pd.DataFrame(rows)
+data.to_csv(f"{BID}_peak_features.csv",index=False)
+print(f"\n✅ {len(data)}样本 → {BID}_peak_features.csv")
+print(f"锚定成功率(有峰且窗口内): 见上每文件")
+
+# 自检:峰随老化移动 + 特征与SOH相关性
+d=data.sort_values('SOH',ascending=False)
+print(f"\n峰位 Vpeak: 早期{d['Vpeak'].head(50).mean():.4f} → 晚期{d['Vpeak'].tail(50).mean():.4f}V")
+print(f"dVpeak与SOH相关性: {data['dVpeak'].corr(data['SOH']):+.3f}")
+print(f"IC峰中心(IC_8)与SOH相关性: {data['IC_8'].corr(data['SOH']):+.3f}")
+print(f"\nDNN输入: X[{len(data)},16,3] + 标量[Vpeak0={Vpeak0:.3f}固定, dVpeak] + 工况 + SOH")
