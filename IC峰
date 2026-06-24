@@ -1,0 +1,117 @@
+验证峰的存在
+"""
+验证IC峰:不同SOC/DOD电池,每个3C循环能否各自找到峰
+- 绝对电压网格 + 高斯平滑 + dQ/dV + 找峰
+- 统计:能锚定率、峰位分布、峰随老化移动
+"""
+import s3fs, re, numpy as np, pandas as pd
+import pyarrow.parquet as pq
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
+import warnings; warnings.filterwarnings('ignore')
+from s3_credentials import S3_ACCESS_KEY, S3_SECRET_KEY
+OPTS={"key":S3_ACCESS_KEY,"secret":S3_SECRET_KEY,
+      "client_kwargs":{"endpoint_url":"https://iseadocker.isea.rwth-aachen.de:9000","region_name":"us-east-1"},
+      "config_kwargs":{"s3":{"addressing_style":"path"},"signature_version":"s3v4"}}
+RAWBASE="projects/j8005-metabatt/Metabatt/A123"
+CAP="projects/j8005-metabatt/Metabatt/A123/40_capacity_monitore"
+fs=s3fs.S3FileSystem(**OPTS)
+
+# 验证电池:覆盖不同SOC/DOD(从模块1清单挑)
+VERIFY={
+    "008":"35℃/70SOC/60DOD",
+    "011":"35℃/30SOC/60DOD",
+    "012":"35℃/70SOC/20DOD",   # 浅DOD
+    "028":"35℃/50SOC/100DOD",  # 深DOD
+    "125":"35℃/10SOC/20DOD",   # 极低SOC浅DOD(最可能没峰)
+    "129":"35℃/90SOC/20DOD",   # 极高SOC浅DOD
+}
+
+def parse_cond(af):
+    for f in af:
+        m=re.search(r'(\d+)grad_(\d+)SOC_(\d+)DOD_(\d+)C',f.split('/')[-1])
+        if m: return {'Temp':int(m.group(1)),'SOC':int(m.group(2)),'DOD':int(m.group(3)),'C_Rate':int(m.group(4))}
+    return None
+def load_soh(bid):
+    f=f"{CAP}/METABatt_A123_APR18650M1B_{bid}_capacity.csv"
+    c=pd.read_csv(f"s3://{f}",storage_options=OPTS).dropna(subset=['SOH'])
+    c['t']=pd.to_datetime(c['CAP_start_time']); c=c.sort_values('t')
+    return c['t'].astype('int64').values,c['SOH'].values,c['Capacity_py'].iloc[0]
+def get_raw(df,state,sign):
+    m=((df['Zustand']==state)&(np.sign(df['Strom'])==sign)).values
+    ch=np.diff(m.astype(int));st=np.where(ch==1)[0]+1;en=np.where(ch==-1)[0]+1
+    if len(m)>0 and m[0]:st=np.r_[0,st]
+    if len(en)<len(st):en=np.r_[en,len(df)]
+    return [df.iloc[s:e] for s,e in zip(st,en) if e-s>=30]
+def is_3c(seg,C0):
+    I=abs(seg['Strom'].mean())
+    tt=(pd.to_datetime(seg['Zeit'])-pd.to_datetime(seg['Zeit']).iloc[0]).dt.total_seconds().values
+    return (3*C0*0.75<I<3*C0*1.25) and tt[-1]>=60   # ±25%容差(按你文档)
+
+def find_ic_peak(seg, dv=0.005, sigma=2):
+    """放电段→绝对电压网格→高斯平滑→IC→找峰。返回峰位V_peak或None"""
+    V=seg['Spannung'].values; I=seg['Strom'].values
+    tt=(pd.to_datetime(seg['Zeit'])-pd.to_datetime(seg['Zeit']).iloc[0]).dt.total_seconds().values
+    Q=np.cumsum(np.abs(I)*np.diff(tt,prepend=tt[0])/3600.0)
+    if Q[-1]<=0: return None,None,None
+    # 放电:电压从高到低,反转使电压递增便于处理
+    o=np.argsort(V); Vs=V[o]; Qs=Q[o]
+    Vu,idx=np.unique(Vs,return_index=True); Qu=Qs[idx]
+    if len(Vu)<10: return None,None,None
+    # 插值到绝对电压网格
+    vgrid=np.arange(Vu.min(),Vu.max(),dv)
+    if len(vgrid)<10: return None,None,None
+    Qg=np.interp(vgrid,Vu,Qu)
+    # 高斯平滑
+    Qsm=gaussian_filter1d(Qg,sigma=sigma)
+    # IC=dQ/dV
+    IC=np.gradient(Qsm,vgrid)
+    IC=np.abs(IC)   # 放电dQ/dV取绝对值看峰
+    # 找峰:要求突出度(避免噪声)
+    if IC.max()<=0: return None,None,None
+    peaks,props=find_peaks(IC, prominence=IC.max()*0.15)  # 突出度>15%最大值
+    if len(peaks)==0: return None,vgrid,IC
+    # 取最高的峰
+    main=peaks[np.argmax(IC[peaks])]
+    return vgrid[main], vgrid, IC
+
+# ===== 验证每块电池 =====
+for bid,desc in VERIFY.items():
+    BASE=f"{RAWBASE}/METABatt_A123_APR18650M1B_{bid}"
+    try: aging=sorted([f for f in fs.ls(BASE) if 'Aging' in f and 'Cyc' in f])
+    except: print(f"{bid} 无文件夹"); continue
+    if not aging: continue
+    cond=parse_cond(aging); soh_t,soh_v,C0=load_soh(bid)
+    print(f"\n{'='*50}\n电池{bid} {desc}, C0={C0:.3f}")
+
+    peak_records=[]   # (SOH, V_peak)
+    n_total=0; n_found=0
+    for fi,f in enumerate(aging):
+        with fs.open(f) as fh:
+            df=next(pq.ParquetFile(fh).iter_batches(batch_size=500000,
+                    columns=['Zeit','Spannung','Strom','Zustand']).__iter__()).to_pandas()
+        df['Zeit']=pd.to_datetime(df['Zeit'])
+        dch=[s for s in get_raw(df,'DCH',-1) if is_3c(s,C0)]
+        for seg in dch:
+            n_total+=1
+            vpeak,_,_=find_ic_peak(seg)
+            t=pd.to_datetime(seg['Zeit'].iloc[0])
+            soh=float(np.interp(t.value,soh_t,soh_v))
+            if vpeak is not None:
+                n_found+=1; peak_records.append({'SOH':soh,'Vpeak':vpeak})
+    pr=pd.DataFrame(peak_records)
+    print(f"  能锚定率: {n_found}/{n_total} = {n_found/max(n_total,1)*100:.1f}%")
+    if len(pr)>5:
+        print(f"  峰位范围: {pr['Vpeak'].min():.3f}~{pr['Vpeak'].max():.3f}V (中位{pr['Vpeak'].median():.3f})")
+        # 峰随老化移动:早期vs晚期
+        pr=pr.sort_values('SOH',ascending=False)
+        early=pr.head(len(pr)//5); late=pr.tail(len(pr)//5)
+        print(f"  峰位随老化: 早期(SOH{early['SOH'].mean():.0f})={early['Vpeak'].mean():.4f}V "
+              f"→ 晚期(SOH{late['SOH'].mean():.0f})={late['Vpeak'].mean():.4f}V "
+              f"(横移{(early['Vpeak'].mean()-late['Vpeak'].mean())*1000:+.1f}mV)")
+
+print(f"\n{'='*50}")
+print("判断:")
+print("- 能锚定率高(>90%)→ 该工况能用峰锚定")
+print("- 不同电池峰位不同但都找到 → 你的'各自找峰'思路成立")
+print("- 峰位随老化横移 → ΔV_peak是有效老化特征")
