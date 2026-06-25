@@ -1,0 +1,141 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>2026 Project Plan (May - Nov) — Editable</title><style>
+body{font-family:'Segoe UI',Arial,sans-serif;background:#f0f2f5;padding:24px;color:#2c3e50}
+h2{margin-bottom:6px;color:#1a3a6b;font-size:1.05rem}
+.hint{font-size:.74rem;color:#7f8c8d;margin-bottom:12px}
+.toolbar{margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.toolbar button{font-size:.74rem;padding:6px 12px;border:1px solid #2d5092;background:#fff;color:#1a3a6b;border-radius:6px;cursor:pointer}
+.toolbar button:hover{background:#eaf0fb}
+.toolbar .swatch{width:22px;height:22px;border-radius:4px;border:2px solid #fff;box-shadow:0 0 0 1px #ccc;cursor:pointer}
+.toolbar .swatch.active{box-shadow:0 0 0 2px #1a3a6b}
+.toolbar label{font-size:.74rem;color:#555}
+#chart-wrap{background:#fff;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.08);overflow:auto;display:inline-block;min-width:100%}
+table{border-collapse:collapse;width:100%;table-layout:fixed}
+thead tr.yr th{background:#1a3a6b;color:#fff;text-align:center;padding:8px 4px;font-size:.76rem;font-weight:700;border:1px solid #2d5092;white-space:nowrap}
+thead tr.per th{background:#2d5092;color:#cfe2ff;text-align:center;padding:5px 2px;font-size:.68rem;font-weight:600;border:1px solid #3a63b0;white-space:nowrap}
+th.lh{background:#1a3a6b!important;color:#fff!important;text-align:left!important;padding:6px 14px!important;width:280px;min-width:280px;border:1px solid #2d5092!important}
+tr.grow td{background:#eaf0fb;color:#1a3a6b;font-weight:700;font-size:.76rem;padding:7px 12px;border-top:2px solid #2d5092;border-bottom:1px solid #c8d8ef}
+tr.trow{border-bottom:1px solid #dde3ef}
+td.tlbl{padding:7px 12px 7px 22px;font-size:.76rem;width:280px;min-width:280px;border-right:2px solid #c8d8ef}
+td.tlbl .name{outline:none;display:block}
+td.tlbl .name:focus{background:#fffbe6;border-radius:3px}
+td.tlbl .sub{display:block;font-size:.66rem;color:#7f8c8d;margin-top:1px;font-style:italic;outline:none}
+td.qc{padding:0;min-width:30px;height:26px;border-right:1px solid #dde3ef;cursor:pointer}
+td.qc.ys{border-right:2px solid #b0c4de}
+td.qc:hover{outline:2px solid #1a3a6b;outline-offset:-2px}
+.delrow{cursor:pointer;color:#c0392b;font-weight:700;margin-right:6px;user-select:none}
+</style></head><body>
+<h2 id="title" contenteditable="true">2026 Project Plan (May - Nov)</h2>
+<div class="hint">Click a week cell to paint/clear a bar (uses the selected color). Click task text to rename. Use buttons to add rows/phases. Then "Save HTML" to download your edited version.</div>
+
+<div class="toolbar">
+  <strong style="font-size:.74rem">Color:</strong>
+  <span class="swatch active" data-c="#1a6e9e" style="background:#1a6e9e"></span>
+  <span class="swatch" data-c="#2980b9" style="background:#2980b9"></span>
+  <span class="swatch" data-c="#1e8449" style="background:#1e8449"></span>
+  <span class="swatch" data-c="#27ae60" style="background:#27ae60"></span>
+  <span class="swatch" data-c="#e67e22" style="background:#e67e22"></span>
+  <span class="swatch" data-c="#c0392b" style="background:#c0392b"></span>
+  <span class="swatch" data-c="#8e44ad" style="background:#8e44ad"></span>
+  <span class="swatch" data-c="#ca6f1e" style="background:#ca6f1e"></span>
+  <input type="color" id="customColor" value="#1a6e9e" title="Custom color">
+  <button onclick="addTask()">+ Task row</button>
+  <button onclick="addPhase()">+ Phase</button>
+  <button onclick="saveHTML()">💾 Save HTML</button>
+</div>
+
+<div id="chart-wrap"><table id="gchart"></table></div>
+
+<script>
+const MONTHS=["May 2026","Jun 2026","Jul 2026","Aug 2026","Sep 2026","Oct 2026","Nov 2026"];
+const WPM=4; const NW=MONTHS.length*WPM;
+let curColor="#1a6e9e";
+
+// data model: array of {type:'phase'|'task', name, sub, color, bars:[...]}
+// bars = array length NW; each = color string or null
+const DATA=[
+ {type:'phase',name:'Phase 1: Aging Decomposition & Initial Validation',accent:'#1a6e9e'},
+ {type:'task',name:'Literature Review',sub:'Review existing models',bars:span(0,23,'#1a6e9e')},
+ {type:'task',name:'Data Preprocessing',sub:'Data Preprocessing & Environment Setup',bars:span(2,5,'#2980b9')},
+ {type:'task',name:'Aging Metrics',sub:'Feature Extraction & Aging Metrics Calculation',bars:span(0,7,'#1a6e9e')},
+ {type:'task',name:'Degradation Modeling',sub:'Degradation Mode Decoupling & Modeling',bars:span(4,7,'#1e8449')},
+ {type:'task',name:'First Defense',sub:'Defense PPT Structuring & Layout Optimization',bars:span(6,7,'#52be80')},
+ {type:'phase',name:'Phase 2: Transfer Learning & Model Comparison',accent:'#27ae60'},
+ {type:'task',name:'Baseline Model Construction',sub:'Baseline Model Construction & Training',bars:span(8,15,'#27ae60')},
+ {type:'task',name:'Transfer Learning Strategy',sub:'',bars:span(9,15,'#1e8449')},
+ {type:'task',name:'Comparison',sub:'Comprehensive Model Evaluation & Comparison',bars:span(8,15,'#2980b9')},
+ {type:'task',name:'Second Defense',sub:'Defense PPT Structuring & Layout Optimization',bars:span(8,15,'#a9dfbf')},
+ {type:'phase',name:'Phase 3: Thesis Writing & Refinement',accent:'#e67e22'},
+ {type:'task',name:'Thesis Outline',sub:'Write docs',bars:span(16,23,'#e67e22')},
+ {type:'task',name:'Core Chapters & Results Discussion',sub:'',bars:span(18,23,'#c0392b')},
+ {type:'task',name:'New Task',sub:'Code Refactoring & Repository Documentation',bars:span(21,23,'#27ae60')},
+ {type:'task',name:'Final Thesis Submission',sub:'',bars:span(22,23,'#e67e22')},
+ {type:'task',name:'Mock & Final Graduation Defense',sub:'',bars:span(27,27,'#ca6f1e')},
+];
+function span(s,e,c){const a=Array(NW).fill(null);for(let i=s;i<=e;i++)a[i]=c;return a;}
+
+function render(){
+  const t=document.getElementById('gchart');
+  let h='<thead><tr class="yr"><th class="lh" rowspan="2">Task</th>';
+  MONTHS.forEach(m=>h+=`<th colspan="4">${m}</th>`);
+  h+='</tr><tr class="per">';
+  for(let i=0;i<NW;i++){const ys=(i%4===3)?'ys':'';h+=`<th class="${ys}">W${(i%4)+1}</th>`;}
+  h+='</tr></thead><tbody>';
+  DATA.forEach((row,ri)=>{
+    if(row.type==='phase'){
+      h+=`<tr class="grow"><td colspan="${NW+1}" style="border-left:4px solid ${row.accent}">`
+        +`<span class="delrow" onclick="delRow(${ri})">✕</span>`
+        +`<span contenteditable="true" oninput="DATA[${ri}].name=this.innerText">${row.name}</span></td></tr>`;
+    } else {
+      h+=`<tr class="trow"><td class="tlbl"><span class="delrow" onclick="delRow(${ri})">✕</span>`
+        +`<span class="name" contenteditable="true" oninput="DATA[${ri}].name=this.innerText">${row.name}</span>`
+        +`<span class="sub" contenteditable="true" oninput="DATA[${ri}].sub=this.innerText">${row.sub||''}</span></td>`;
+      for(let i=0;i<NW;i++){
+        const ys=(i%4===3)?'ys':'';const c=row.bars[i];
+        const bar=c?`<span style="display:block;height:17px;width:100%;background:${c}"></span>`:'';
+        h+=`<td class="qc ${ys}" onclick="toggle(${ri},${i})">${bar}</td>`;
+      }
+      h+='</tr>';
+    }
+  });
+  h+='</tbody>';
+  t.innerHTML=h;
+}
+function toggle(ri,i){
+  const r=DATA[ri];
+  r.bars[i]= r.bars[i]? null : curColor;
+  render();
+}
+function delRow(ri){ if(confirm('Delete this row?')){DATA.splice(ri,1);render();} }
+function addTask(){ DATA.push({type:'task',name:'New Task',sub:'',bars:Array(NW).fill(null)});render(); }
+function addPhase(){ DATA.push({type:'phase',name:'New Phase',accent:curColor});render(); }
+
+// color picker
+document.querySelectorAll('.swatch').forEach(s=>{
+  s.onclick=()=>{curColor=s.dataset.c;
+    document.querySelectorAll('.swatch').forEach(x=>x.classList.remove('active'));
+    s.classList.add('active');
+    document.getElementById('customColor').value=s.dataset.c;};
+});
+document.getElementById('customColor').oninput=function(){curColor=this.value;
+  document.querySelectorAll('.swatch').forEach(x=>x.classList.remove('active'));};
+
+function saveHTML(){
+  // rebuild a clean static HTML from current DATA
+  let body=`<h2>${document.getElementById('title').innerText}</h2><div id="chart-wrap"><table>`;
+  body+=document.getElementById('gchart').innerHTML
+        .replace(/ onclick="[^"]*"/g,'')
+        .replace(/<span class="delrow"[^>]*>✕<\/span>/g,'')
+        .replace(/ contenteditable="true"/g,'')
+        .replace(/ oninput="[^"]*"/g,'');
+  body+='</table></div>';
+  const css=document.querySelector('style').outerHTML;
+  const full=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Gantt</title>${css}</head><body>${body}</body></html>`;
+  const blob=new Blob([full],{type:'text/html'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='gantt_edited.html';a.click();
+}
+render();
+</script>
+</body></html>
