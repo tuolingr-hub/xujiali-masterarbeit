@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(pip list *)",
+      "Bash(python -m py_compile extract_nca_x_matrix.py)"
+    ]
+  }
+}
